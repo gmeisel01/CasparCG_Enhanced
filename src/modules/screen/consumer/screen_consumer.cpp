@@ -80,13 +80,6 @@ enum class stretch
 
 struct configuration
 {
-    enum class aspect_ratio
-    {
-        aspect_4_3 = 0,
-        aspect_16_9,
-        aspect_invalid,
-    };
-
     enum class colour_spaces
     {
         RGB               = 0,
@@ -94,46 +87,63 @@ struct configuration
         datavideo_limited = 2
     };
 
-    std::wstring    name          = L"Screen consumer";
-    int             screen_index  = 0;
-    int             screen_x      = 0;
-    int             screen_y      = 0;
-    int             screen_width  = 0;
-    int             screen_height = 0;
-    screen::stretch stretch       = screen::stretch::fill;
-    bool            windowed      = true;
-    bool            key_only      = false;
-    bool            sbs_key       = false;
-    aspect_ratio    aspect        = aspect_ratio::aspect_invalid;
-    bool            vsync         = false;
-    bool            interactive   = true;
-    bool            borderless    = false;
-    bool            always_on_top = false;
-    colour_spaces   colour_space  = colour_spaces::RGB;
-    bool            high_bitdepth = false;
-    bool            gpu_texture   = false;
+    std::wstring    name                = L"Screen consumer";
+    int             screen_index        = 0;
+    int             screen_x            = 0;
+    int             screen_y            = 0;
+    int             screen_width        = 0;
+    int             screen_height       = 0;
+    screen::stretch stretch             = screen::stretch::fill;
+    bool            windowed            = true;
+    bool            key_only            = false;
+    bool            sbs_key             = false;
+    double          aspect_ratio        = 1.777; // Default to 16:9, replaces enum
+    bool            force_linear_filter = false;
+    bool            enable_mipmaps      = false;
+    double          brightness_boost    = 1.0;
+    double          saturation_boost    = 1.0;
+    bool            high_quality_chroma = false;
+    bool            vsync               = false;
+    bool            interactive         = true;
+    bool            borderless          = false;
+    bool            always_on_top       = false;
+    colour_spaces   colour_space        = colour_spaces::RGB;
 };
 
 struct frame
 {
-    GLuint                         pbo = 0;
-    GLuint                         tex = 0;
-    char*                          ptr = nullptr;
-    std::shared_ptr<core::texture> texture;
-    GLsync                         fence = nullptr;
+    GLuint pbo   = 0;
+    GLuint tex   = 0;
+    char*  ptr   = nullptr;
+    GLsync fence = nullptr;
 };
 
-struct screen_consumer;
-
-struct display_strategy
+// Helper function to parse aspect ratio from string
+double parse_aspect_ratio(const std::wstring& aspect_str)
 {
-    virtual ~display_strategy() {}
-    virtual frame init_frame(const configuration& config, const core::video_format_desc& format_desc) = 0;
-    virtual void  cleanup_frame(frame& frame)                                                         = 0;
-    virtual void  do_tick(screen_consumer* self)                                                      = 0;
-};
-struct gpu_strategy;
-struct host_strategy;
+    if (aspect_str.find(L'/') != std::wstring::npos) {
+        // Parse "3840/1080" format
+        auto   pos    = aspect_str.find(L'/');
+        double width  = std::stod(aspect_str.substr(0, pos));
+        double height = std::stod(aspect_str.substr(pos + 1));
+        if (height == 0.0) {
+            CASPAR_LOG(warning) << L"Invalid aspect ratio denominator, using default 16:9";
+            return 1.777;
+        }
+        return width / height;
+    }
+    // Parse decimal format "3.555"
+    double result = std::stod(aspect_str);
+
+    // Validate reasonable bounds
+    if (result < 0.1 || result > 10.0) {
+        CASPAR_LOG(warning) << L"Aspect ratio " << aspect_str
+                            << L" out of reasonable range (0.1-10.0), using default 16:9";
+        return 1.777;
+    }
+
+    return result;
+}
 
 struct screen_consumer
 {
@@ -166,35 +176,22 @@ struct screen_consumer
     std::atomic<bool> is_running_{true};
     std::thread       thread_;
 
-    spl::shared_ptr<display_strategy> strategy_;
-
     screen_consumer(const screen_consumer&)            = delete;
     screen_consumer& operator=(const screen_consumer&) = delete;
+
+    std::atomic<bool> window_visible_{true};
+    std::atomic<bool> visibility_change_requested_{false};
+    std::atomic<bool> new_visibility_state_{true};
 
   public:
     screen_consumer(const configuration& config, const core::video_format_desc& format_desc, int channel_index)
         : config_(config)
         , format_desc_(format_desc)
         , channel_index_(channel_index)
-        , strategy_(config.gpu_texture ? spl::make_shared<display_strategy, gpu_strategy>()
-                                       : spl::make_shared<display_strategy, host_strategy>())
     {
-        if (config_.gpu_texture) {
-            CASPAR_LOG(info) << print() << " Using GPU texture for rendering.";
-        } else {
-            CASPAR_LOG(info) << print() << " Using frame copied to host for rendering.";
-        }
-
-        if (format_desc_.format == core::video_format::ntsc &&
-            config_.aspect == configuration::aspect_ratio::aspect_4_3) {
-            // Use default values which are 4:3.
-        } else {
-            if (config_.aspect == configuration::aspect_ratio::aspect_16_9) {
-                square_width_ = format_desc.height * 16 / 9;
-            } else if (config_.aspect == configuration::aspect_ratio::aspect_4_3) {
-                square_width_ = format_desc.height * 4 / 3;
-            }
-        }
+        // Calculate square dimensions based on custom aspect ratio
+        square_width_  = static_cast<int>(format_desc.height * config_.aspect_ratio);
+        square_height_ = format_desc.height;
 
         frame_buffer_.set_capacity(1);
 
@@ -205,73 +202,279 @@ struct screen_consumer
         diagnostics::register_graph(graph_);
 
 #if defined(_MSC_VER)
+        CASPAR_LOG(info) << print() << L" Starting comprehensive display device enumeration...";
+
         DISPLAY_DEVICE              d_device = {sizeof(d_device), 0};
         std::vector<DISPLAY_DEVICE> displayDevices;
+
+        // STEP 1: Enumerate all display devices
+        CASPAR_LOG(info) << print() << L" Enumerating all display devices...";
+
         for (int n = 0; EnumDisplayDevices(nullptr, n, &d_device, NULL); ++n) {
             displayDevices.push_back(d_device);
+
+            // Log each device found
+            CASPAR_LOG(info) << print() << L" Device " << n << L": " << d_device.DeviceName << L" ("
+                             << d_device.DeviceString << L")";
+
+            // Log device flags
+            std::wstring flags;
+            if (d_device.StateFlags & DISPLAY_DEVICE_ACTIVE)
+                flags += L"ACTIVE ";
+            if (d_device.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE)
+                flags += L"PRIMARY ";
+            if (d_device.StateFlags & DISPLAY_DEVICE_MIRRORING_DRIVER)
+                flags += L"MIRRORING ";
+            if (d_device.StateFlags & DISPLAY_DEVICE_VGA_COMPATIBLE)
+                flags += L"VGA ";
+            if (d_device.StateFlags & DISPLAY_DEVICE_REMOVABLE)
+                flags += L"REMOVABLE ";
+
+            CASPAR_LOG(info) << print() << L"   State Flags: " << flags;
+
+            // Clear for next iteration
+            memset(&d_device, 0, sizeof(d_device));
+            d_device.cb = sizeof(d_device);
         }
 
-        if (config_.screen_index >= displayDevices.size()) {
-            CASPAR_LOG(warning) << print() << L" Invalid screen-index: " << config_.screen_index;
+        CASPAR_LOG(info) << print() << L" Total devices found: " << displayDevices.size();
+
+        // STEP 2: Get detailed settings for EACH display device
+        CASPAR_LOG(info) << print() << L" Getting detailed settings for each display:";
+
+        for (size_t i = 0; i < displayDevices.size(); ++i) {
+            DEVMODE devmode = {};
+            BOOL    result  = EnumDisplaySettings(displayDevices[i].DeviceName, ENUM_CURRENT_SETTINGS, &devmode);
+
+            if (result) {
+                CASPAR_LOG(info) << print() << L" Display " << i << L" (" << displayDevices[i].DeviceName << L"):";
+                CASPAR_LOG(info) << print() << L"   Position: (" << devmode.dmPosition.x << L", "
+                                 << devmode.dmPosition.y << L")";
+                CASPAR_LOG(info) << print() << L"   Resolution: " << devmode.dmPelsWidth << L"x"
+                                 << devmode.dmPelsHeight;
+                CASPAR_LOG(info) << print() << L"   Bits per pixel: " << devmode.dmBitsPerPel;
+                CASPAR_LOG(info) << print() << L"   Display frequency: " << devmode.dmDisplayFrequency << L"Hz";
+                CASPAR_LOG(info) << print() << L"   Active: "
+                                 << ((displayDevices[i].StateFlags & DISPLAY_DEVICE_ACTIVE) ? L"Yes" : L"No");
+                CASPAR_LOG(info) << print() << L"   Primary: "
+                                 << ((displayDevices[i].StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) ? L"Yes" : L"No");
+            } else {
+                CASPAR_LOG(warning) << print() << L" Could not get settings for display " << i << L" ("
+                                    << displayDevices[i].DeviceName << L")";
+            }
         }
 
-        DEVMODE devmode = {};
-        if (!EnumDisplaySettings(displayDevices[config_.screen_index].DeviceName, ENUM_CURRENT_SETTINGS, &devmode)) {
-            CASPAR_LOG(warning) << print() << L" Could not find display settings for screen-index: "
-                                << config_.screen_index;
+        // STEP 3: Validate and use the requested screen index
+        CASPAR_LOG(info) << print() << L" Requested screen_index: " << config_.screen_index;
+
+        int selected_screen_index = config_.screen_index; // Create a mutable copy
+
+        if (selected_screen_index >= static_cast<int>(displayDevices.size())) {
+            CASPAR_LOG(warning) << print() << L" Invalid screen-index: " << selected_screen_index << L" (only "
+                                << displayDevices.size() << L" devices available)";
+            CASPAR_LOG(warning) << print() << L" Falling back to primary display (index 0)";
+
+            // Find primary display as fallback
+            for (size_t i = 0; i < displayDevices.size(); ++i) {
+                if (displayDevices[i].StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) {
+                    selected_screen_index = static_cast<int>(i);
+                    CASPAR_LOG(info) << print() << L" Using primary display at index " << i;
+                    break;
+                }
+            }
         }
 
-        screen_x_      = devmode.dmPosition.x;
-        screen_y_      = devmode.dmPosition.y;
-        screen_width_  = devmode.dmPelsWidth;
-        screen_height_ = devmode.dmPelsHeight;
+        // Ensure we have a valid index
+        if (selected_screen_index < 0 || selected_screen_index >= static_cast<int>(displayDevices.size())) {
+            selected_screen_index = 0; // Ultimate fallback
+            CASPAR_LOG(warning) << print() << L" Using display index 0 as final fallback";
+        }
+
+        // STEP 4: Get settings for the selected display
+        DEVMODE selectedDevMode = {};
+        BOOL    result          = EnumDisplaySettings(
+            displayDevices[selected_screen_index].DeviceName, ENUM_CURRENT_SETTINGS, &selectedDevMode);
+
+        if (!result) {
+            CASPAR_LOG(error) << print() << L" Could not get display settings for selected screen-index: "
+                              << selected_screen_index;
+            // Try to get primary display settings as final fallback
+            result = EnumDisplaySettings(nullptr, ENUM_CURRENT_SETTINGS, &selectedDevMode);
+        }
+
+        if (result) {
+            screen_x_      = selectedDevMode.dmPosition.x;
+            screen_y_      = selectedDevMode.dmPosition.y;
+            screen_width_  = selectedDevMode.dmPelsWidth;
+            screen_height_ = selectedDevMode.dmPelsHeight;
+
+            CASPAR_LOG(info) << print() << L" Selected display " << selected_screen_index << L" settings:";
+            CASPAR_LOG(info) << print() << L"   Device: " << displayDevices[selected_screen_index].DeviceName;
+            CASPAR_LOG(info) << print() << L"   Description: " << displayDevices[selected_screen_index].DeviceString;
+            CASPAR_LOG(info) << print() << L"   Position: (" << screen_x_ << L", " << screen_y_ << L")";
+            CASPAR_LOG(info) << print() << L"   Resolution: " << screen_width_ << L"x" << screen_height_;
+        } else {
+            CASPAR_LOG(error) << print() << L" Failed to get any valid display settings!";
+            // Set some defaults
+            screen_x_      = 0;
+            screen_y_      = 0;
+            screen_width_  = 1920;
+            screen_height_ = 1080;
+            CASPAR_LOG(warning) << print() << L" Using default settings: " << screen_width_ << L"x" << screen_height_
+                                << L" at (0,0)";
+        }
+
 #else
+        CASPAR_LOG(info) << print() << L" Linux platform detected";
         if (config_.screen_index > 1) {
             CASPAR_LOG(warning) << print() << L" Screen-index is not supported on linux";
         }
 #endif
 
-        if (config.windowed) {
-            screen_x_ += config.screen_x;
-            screen_y_ += config.screen_y;
+        if (config_.windowed) {
+            // WINDOWED MODE: Use device position + offset
+            screen_x_ += config_.screen_x;
+            screen_y_ += config_.screen_y;
 
-            if (config.screen_width > 0 && config.screen_height > 0) {
-                screen_width_  = config.screen_width;
-                screen_height_ = config.screen_height;
-            } else if (config.screen_width > 0) {
-                screen_width_  = config.screen_width;
-                screen_height_ = square_height_ * config.screen_width / square_width_;
-            } else if (config.screen_height > 0) {
-                screen_height_ = config.screen_height;
-                screen_width_  = square_width_ * config.screen_height / square_height_;
+            if (config_.screen_width > 0 && config_.screen_height > 0) {
+                screen_width_  = config_.screen_width;
+                screen_height_ = config_.screen_height;
+                CASPAR_LOG(info) << print() << L" Windowed mode: Using explicit size " << screen_width_ << L"x"
+                                 << screen_height_;
+            } else if (config_.screen_width > 0) {
+                screen_width_  = config_.screen_width;
+                screen_height_ = square_height_ * config_.screen_width / square_width_;
+                CASPAR_LOG(info) << print() << L" Windowed mode: Calculated height from width " << screen_width_ << L"x"
+                                 << screen_height_;
+            } else if (config_.screen_height > 0) {
+                screen_height_ = config_.screen_height;
+                screen_width_  = square_width_ * config_.screen_height / square_height_;
+                CASPAR_LOG(info) << print() << L" Windowed mode: Calculated width from height " << screen_width_ << L"x"
+                                 << screen_height_;
             } else {
                 screen_width_  = square_width_;
                 screen_height_ = square_height_;
+                CASPAR_LOG(info) << print() << L" Windowed mode: Using square dimensions " << screen_width_ << L"x"
+                                 << screen_height_;
+            }
+
+            CASPAR_LOG(info) << print() << L" Windowed mode final position: (" << screen_x_ << L", " << screen_y_
+                             << L")";
+
+        } else {
+            // FULLSCREEN MODE: Honor explicit dimensions for multi-display spanning
+
+            if (config_.screen_width > 0 && config_.screen_height > 0) {
+                // EXPLICIT DIMENSIONS - Allow multi-display spanning
+                screen_width_  = config_.screen_width;
+                screen_height_ = config_.screen_height;
+
+                // Use explicit position if provided, OTHERWISE use device position
+                if (config_.screen_x != 0 || config_.screen_y != 0) {
+                    // EXPLICIT POSITION - Replace device position entirely
+                    screen_x_ = config_.screen_x;
+                    screen_y_ = config_.screen_y;
+                    CASPAR_LOG(info) << print() << L" Fullscreen mode: Using explicit position and size";
+                    CASPAR_LOG(info) << print() << L"   Position: (" << screen_x_ << L", " << screen_y_ << L")";
+                    CASPAR_LOG(info) << print() << L"   Size: " << screen_width_ << L"x" << screen_height_;
+                    CASPAR_LOG(info) << print() << L"   This will span multiple displays if needed";
+                } else {
+                    // Keep device position but use explicit size
+                    CASPAR_LOG(info) << print() << L" Fullscreen mode: Using device position with explicit size";
+                    CASPAR_LOG(info) << print() << L"   Device position: (" << screen_x_ << L", " << screen_y_ << L")";
+                    CASPAR_LOG(info) << print() << L"   Explicit size: " << screen_width_ << L"x" << screen_height_;
+                }
+            } else if (config_.screen_width > 0) {
+                // Width specified, calculate height
+                screen_width_  = config_.screen_width;
+                screen_height_ = square_height_ * config_.screen_width / square_width_;
+                CASPAR_LOG(info) << print() << L" Fullscreen mode: Calculated height from width " << screen_width_
+                                 << L"x" << screen_height_;
+
+            } else if (config_.screen_height > 0) {
+                // Height specified, calculate width
+                screen_height_ = config_.screen_height;
+                screen_width_  = square_width_ * config_.screen_height / square_height_;
+                CASPAR_LOG(info) << print() << L" Fullscreen mode: Calculated width from height " << screen_width_
+                                 << L"x" << screen_height_;
+
+            } else {
+                // NO EXPLICIT DIMENSIONS - Use single display fullscreen (original behavior)
+                // This preserves the original behavior when no dimensions are specified
+                CASPAR_LOG(info) << print() << L" Fullscreen mode: No explicit dimensions, using single display";
+                // screen_width_ and screen_height_ already set from device enumeration
             }
         }
 
+        CASPAR_LOG(info) << print() << L" Final window parameters:";
+        CASPAR_LOG(info) << print() << L"   Position: (" << screen_x_ << L", " << screen_y_ << L")";
+        CASPAR_LOG(info) << print() << L"   Size: " << screen_width_ << L"x" << screen_height_;
+        CASPAR_LOG(info) << print() << L"   Windowed: " << (config_.windowed ? L"true" : L"false");
+
         thread_ = std::thread([this] {
             try {
-                const auto    window_style = config_.borderless ? sf::Style::None
-                                             : config_.windowed ? sf::Style::Resize | sf::Style::Close
-                                                                : sf::Style::Fullscreen;
-                sf::VideoMode desktop      = sf::VideoMode::getDesktopMode();
+                sf::Uint32 window_style;
+                if (config_.borderless) {
+                    window_style = sf::Style::None;
+                    CASPAR_LOG(info) << print() << L" Window style: Borderless";
+                } else if (config_.windowed) {
+                    window_style = sf::Style::Resize | sf::Style::Close;
+                    CASPAR_LOG(info) << print() << L" Window style: Windowed with controls";
+                } else {
+                    // For fullscreen, check if we're spanning multiple displays
+                    if ((config_.screen_width > 0 && config_.screen_width != screen_width_) ||
+                        (config_.screen_height > 0 && config_.screen_height != screen_height_) ||
+                        (config_.screen_x != 0 || config_.screen_y != 0)) {
+                        // Custom dimensions or position - use borderless for multi-display spanning
+                        window_style = sf::Style::None;
+                        CASPAR_LOG(info) << print() << L" Window style: Borderless (multi-display spanning)";
+                    } else {
+                        // Standard single-display fullscreen
+                        window_style = sf::Style::Fullscreen;
+                        CASPAR_LOG(info) << print() << L" Window style: True fullscreen";
+                    }
+                }
+
+                sf::VideoMode desktop = sf::VideoMode::getDesktopMode();
                 sf::VideoMode mode(
                     config_.sbs_key ? screen_width_ * 2 : screen_width_, screen_height_, desktop.bitsPerPixel);
                 window_.create(mode,
                                u8(print()),
                                window_style,
                                sf::ContextSettings(0, 0, 0, 4, 5, sf::ContextSettings::Attribute::Core));
+                CASPAR_LOG(info) << print() << L" Creating window:";
+                CASPAR_LOG(info) << print() << L"   Video mode: " << mode.width << L"x" << mode.height << L"@"
+                                 << mode.bitsPerPixel << L"bpp";
+                CASPAR_LOG(info) << print() << L" Window positioned at: (" << screen_x_ << L", " << screen_y_ << L")";
                 window_.setPosition(sf::Vector2i(screen_x_, screen_y_));
                 window_.setMouseCursorVisible(config_.interactive);
                 window_.setActive(true);
 
+                // ADD THE ALWAYS-ON-TOP SECTION:
                 if (config_.always_on_top) {
+                    CASPAR_LOG(info) << print() << L" Setting window to always-on-top...";
+
 #ifdef _MSC_VER
                     HWND hwnd = window_.getSystemHandle();
-                    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    if (hwnd) {
+                        BOOL result = SetWindowPos(hwnd,           // Window handle
+                                                   HWND_TOPMOST,   // Place on top
+                                                   screen_x_,      // X position (explicit)
+                                                   screen_y_,      // Y position (explicit)
+                                                   screen_width_,  // Width (explicit)
+                                                   screen_height_, // Height (explicit)
+                                                   SWP_SHOWWINDOW  // Show the window
+                        );
+
+                        if (result) {
+                            CASPAR_LOG(info) << print() << L" Successfully set always-on-top";
+                        } else {
+                            CASPAR_LOG(warning) << print() << L" Failed to set always-on-top";
+                        }
+                    }
 #else
                     window_always_on_top(window_);
+                    CASPAR_LOG(info) << print() << L" Set always-on-top (Linux)";
 #endif
                 }
 
@@ -295,9 +498,69 @@ struct screen_consumer
                 shader_->use();
                 shader_->set("background", 0);
                 shader_->set("window_width", screen_width_);
+                shader_->set("brightness_boost", static_cast<float>(config_.brightness_boost));
+                shader_->set("saturation_boost", static_cast<float>(config_.saturation_boost));
 
                 for (int n = 0; n < 2; ++n) {
-                    frames_.push_back(strategy_->init_frame(config_, format_desc_));
+                    screen::frame frame;
+                    auto          flags = GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT | GL_MAP_WRITE_BIT;
+
+                    // Create PBO
+                    GL(glCreateBuffers(1, &frame.pbo));
+                    GL(glNamedBufferStorage(frame.pbo, format_desc_.size, nullptr, flags));
+                    frame.ptr =
+                        reinterpret_cast<char*>(GL2(glMapNamedBufferRange(frame.pbo, 0, format_desc_.size, flags)));
+
+                    // Create texture
+                    GL(glCreateTextures(GL_TEXTURE_2D, 1, &frame.tex));
+
+                    // DEBUG: Log what filtering we're using
+                    CASPAR_LOG(info) << L"Screen consumer texture " << n << L":";
+                    CASPAR_LOG(info) << L"  force_linear_filter: "
+                                     << (config_.force_linear_filter ? L"true" : L"false");
+                    CASPAR_LOG(info) << L"  colour_space: " << static_cast<int>(config_.colour_space);
+                    CASPAR_LOG(info) << L"  enable_mipmaps: " << (config_.enable_mipmaps ? L"true" : L"false");
+
+                    // Determine filtering
+                    GLenum filter_mode;
+                    if (config_.force_linear_filter) {
+                        filter_mode = GL_LINEAR;
+                        CASPAR_LOG(info) << L"  Using GL_LINEAR (forced)";
+                    } else if (config_.colour_space == configuration::colour_spaces::datavideo_full ||
+                               config_.colour_space == configuration::colour_spaces::datavideo_limited) {
+                        filter_mode = GL_NEAREST;
+                        CASPAR_LOG(info) << L"  Using GL_NEAREST (DataVideo)";
+                    } else {
+                        filter_mode = GL_LINEAR;
+                        CASPAR_LOG(info) << L"  Using GL_LINEAR (default RGB)";
+                    }
+
+                    // Apply texture parameters ONCE
+                    GL(glTextureParameteri(frame.tex, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
+                    GL(glTextureParameteri(frame.tex, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
+
+                    // Handle mipmaps
+                    int mip_levels = 1; // Default to single level
+                    if (config_.enable_mipmaps) {
+                        mip_levels =
+                            static_cast<int>(std::floor(std::log2(std::max(format_desc_.width, format_desc_.height)))) +
+                            1;
+                        CASPAR_LOG(info) << L"  Mipmap levels: " << mip_levels;
+
+                        // Set filtering for mipmaps
+                        GL(glTextureParameteri(frame.tex, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR));
+                        GL(glTextureParameteri(frame.tex, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
+                    } else {
+                        // No mipmaps - use simple filtering
+                        GL(glTextureParameteri(frame.tex, GL_TEXTURE_MIN_FILTER, filter_mode));
+                        GL(glTextureParameteri(frame.tex, GL_TEXTURE_MAG_FILTER, filter_mode));
+                    }
+
+                    // Allocate texture storage
+                    GL(glTextureStorage2D(frame.tex, mip_levels, GL_RGBA8, format_desc_.width, format_desc_.height));
+                    GL(glClearTexImage(frame.tex, 0, GL_BGRA, GL_UNSIGNED_BYTE, nullptr));
+
+                    frames_.push_back(frame);
                 }
 
                 GL(glDisable(GL_DEPTH_TEST));
@@ -320,10 +583,6 @@ struct screen_consumer
                                              ? "(Full Range)."
                                              : "(Limited Range).");
                 }
-
-                glClear(GL_COLOR_BUFFER_BIT);
-                window_.display();
-
                 while (is_running_) {
                     tick();
                 }
@@ -333,9 +592,10 @@ struct screen_consumer
                 CASPAR_LOG_CURRENT_EXCEPTION();
                 is_running_ = false;
             }
-
             for (auto frame : frames_) {
-                strategy_->cleanup_frame(frame);
+                GL(glUnmapNamedBuffer(frame.pbo));
+                glDeleteBuffers(1, &frame.pbo);
+                glDeleteTextures(1, &frame.tex);
             }
 
             shader_.reset();
@@ -352,6 +612,10 @@ struct screen_consumer
         frame_buffer_.abort();
         thread_.join();
     }
+
+    void set_visibility(bool visible);
+    void toggle_visibility();
+    bool get_visibility() const;
 
     bool poll()
     {
@@ -370,7 +634,105 @@ struct screen_consumer
 
     void tick()
     {
-        strategy_->do_tick(this);
+        // Handle visibility changes on the render thread
+        if (visibility_change_requested_.load()) {
+            bool new_state = new_visibility_state_.load();
+            window_.setVisible(new_state);
+            window_visible_.store(new_state);
+            visibility_change_requested_.store(false);
+            CASPAR_LOG(info) << print() << L" Window visibility changed to: " << (new_state ? L"visible" : L"hidden");
+        }
+
+        core::const_frame in_frame;
+
+        while (!frame_buffer_.try_pop(in_frame) && is_running_) {
+            // TODO (fix)
+            if (!poll()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
+
+        if (!in_frame) {
+            return;
+        }
+
+        // Upload
+        {
+            auto& frame = frames_.front();
+
+            while (frame.fence != nullptr) {
+                auto wait = glClientWaitSync(frame.fence, 0, 0);
+                if (wait == GL_ALREADY_SIGNALED || wait == GL_CONDITION_SATISFIED) {
+                    glDeleteSync(frame.fence);
+                    frame.fence = nullptr;
+                }
+                if (!poll()) {
+                    // TODO (fix)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            }
+
+            std::memcpy(frame.ptr, in_frame.image_data(0).begin(), format_desc_.size);
+
+            GL(glBindBuffer(GL_PIXEL_UNPACK_BUFFER, frame.pbo));
+            GL(glTextureSubImage2D(
+                frame.tex, 0, 0, 0, format_desc_.width, format_desc_.height, GL_BGRA, GL_UNSIGNED_BYTE, nullptr));
+
+            if (config_.enable_mipmaps) {
+                GL(glGenerateTextureMipmap(frame.tex));
+            }
+
+            GL(glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0));
+            frame.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        }
+
+        // Display
+        {
+            auto& frame = frames_.back();
+
+            GL(glClear(GL_COLOR_BUFFER_BIT));
+
+            GL(glActiveTexture(GL_TEXTURE0));
+            GL(glBindTexture(GL_TEXTURE_2D, frame.tex));
+
+            GL(glBufferData(GL_ARRAY_BUFFER,
+                            static_cast<GLsizeiptr>(sizeof(core::frame_geometry::coord)) * draw_coords_.size(),
+                            draw_coords_.data(),
+                            GL_STATIC_DRAW));
+
+            auto stride = static_cast<GLsizei>(sizeof(core::frame_geometry::coord));
+
+            auto vtx_loc = shader_->get_attrib_location("Position");
+            auto tex_loc = shader_->get_attrib_location("TexCoordIn");
+
+            GL(glEnableVertexAttribArray(vtx_loc));
+            GL(glEnableVertexAttribArray(tex_loc));
+
+            GL(glVertexAttribPointer(vtx_loc, 2, GL_DOUBLE, GL_FALSE, stride, nullptr));
+            GL(glVertexAttribPointer(tex_loc, 4, GL_DOUBLE, GL_FALSE, stride, (GLvoid*)(2 * sizeof(GLdouble))));
+
+            shader_->set("window_width", screen_width_);
+
+            if (config_.sbs_key) {
+                auto coords_size = static_cast<GLsizei>(draw_coords_.size());
+
+                // First half fill
+                shader_->set("key_only", false);
+                GL(glDrawArrays(GL_TRIANGLES, 0, coords_size / 2));
+
+                // Second half key
+                shader_->set("key_only", true);
+                GL(glDrawArrays(GL_TRIANGLES, coords_size / 2, coords_size / 2));
+            } else {
+                shader_->set("key_only", config_.key_only);
+                GL(glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(draw_coords_.size())));
+            }
+
+            GL(glDisableVertexAttribArray(vtx_loc));
+            GL(glDisableVertexAttribArray(tex_loc));
+
+            GL(glBindTexture(GL_TEXTURE_2D, 0));
+        }
 
         window_.display();
 
@@ -380,61 +742,11 @@ struct screen_consumer
         tick_timer_.restart();
     }
 
-    void draw()
-    {
-        GL(glBufferData(GL_ARRAY_BUFFER,
-                        static_cast<GLsizeiptr>(sizeof(core::frame_geometry::coord)) * draw_coords_.size(),
-                        draw_coords_.data(),
-                        GL_STATIC_DRAW));
-
-        auto stride = static_cast<GLsizei>(sizeof(core::frame_geometry::coord));
-
-        auto vtx_loc = shader_->get_attrib_location("Position");
-        auto tex_loc = shader_->get_attrib_location("TexCoordIn");
-
-        GL(glEnableVertexAttribArray(vtx_loc));
-        GL(glEnableVertexAttribArray(tex_loc));
-
-        GL(glVertexAttribPointer(vtx_loc, 2, GL_DOUBLE, GL_FALSE, stride, nullptr));
-        GL(glVertexAttribPointer(tex_loc, 4, GL_DOUBLE, GL_FALSE, stride, (GLvoid*)(2 * sizeof(GLdouble))));
-
-        shader_->set("window_width", screen_width_);
-
-        if (config_.sbs_key) {
-            auto coords_size = static_cast<GLsizei>(draw_coords_.size());
-
-            // First half fill
-            shader_->set("key_only", false);
-            GL(glDrawArrays(GL_TRIANGLES, 0, coords_size / 2));
-
-            // Second half key
-            shader_->set("key_only", true);
-            GL(glDrawArrays(GL_TRIANGLES, coords_size / 2, coords_size / 2));
-        } else {
-            shader_->set("key_only", config_.key_only);
-            GL(glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(draw_coords_.size())));
-        }
-
-        GL(glDisableVertexAttribArray(vtx_loc));
-        GL(glDisableVertexAttribArray(tex_loc));
-        GL(glBindTexture(GL_TEXTURE_2D, 0));
-    }
-
     std::future<bool> send(core::video_field field, const core::const_frame& frame)
     {
-        const int MAX_TRIES = 3;
-        int       count     = 0;
-        while (count++ < MAX_TRIES && is_running_) {
-            if (frame_buffer_.try_push(frame))
-                break;
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-
-        if (count == MAX_TRIES) {
+        if (!frame_buffer_.try_push(frame)) {
             graph_->set_tag(diagnostics::tag_severity::WARNING, "dropped-frame");
         }
-
         return make_ready_future(is_running_.load());
     }
 
@@ -497,21 +809,20 @@ struct screen_consumer
         }
     }
 
-    std::pair<float, float> none() const
+    std::pair<float, float> uniform() const
     {
-        float width =
-            static_cast<float>(config_.sbs_key ? square_width_ * 2 : square_width_) / static_cast<float>(screen_width_);
-        float height = static_cast<float>(square_height_) / static_cast<float>(screen_height_);
+        float aspect = static_cast<float>(config_.sbs_key ? config_.aspect_ratio * 2 : config_.aspect_ratio);
+        float width  = std::min(1.0f, static_cast<float>(screen_height_) * aspect / static_cast<float>(screen_width_));
+        float height = static_cast<float>(screen_width_ * width) / static_cast<float>(screen_height_ * aspect);
 
         return std::make_pair(width, height);
     }
 
-    std::pair<float, float> uniform() const
+    std::pair<float, float> none() const
     {
-        float aspect = static_cast<float>(config_.sbs_key ? square_width_ * 2 : square_width_) /
-                       static_cast<float>(square_height_);
-        float width  = std::min(1.0f, static_cast<float>(screen_height_) * aspect / static_cast<float>(screen_width_));
-        float height = static_cast<float>(screen_width_ * width) / static_cast<float>(screen_height_ * aspect);
+        float aspect = static_cast<float>(config_.sbs_key ? config_.aspect_ratio * 2 : config_.aspect_ratio);
+        float width  = aspect * static_cast<float>(format_desc_.height) / static_cast<float>(screen_width_);
+        float height = static_cast<float>(format_desc_.height) / static_cast<float>(screen_height_);
 
         return std::make_pair(width, height);
     }
@@ -520,10 +831,10 @@ struct screen_consumer
 
     std::pair<float, float> uniform_to_fill() const
     {
-        float wr =
-            static_cast<float>(config_.sbs_key ? square_width_ * 2 : square_width_) / static_cast<float>(screen_width_);
-        float hr    = static_cast<float>(square_height_) / static_cast<float>(screen_height_);
-        float r_inv = 1.0f / std::min(wr, hr);
+        float aspect = static_cast<float>(config_.sbs_key ? config_.aspect_ratio * 2 : config_.aspect_ratio);
+        float wr     = aspect * static_cast<float>(format_desc_.height) / static_cast<float>(screen_width_);
+        float hr     = static_cast<float>(format_desc_.height) / static_cast<float>(screen_height_);
+        float r_inv  = 1.0f / std::min(wr, hr);
 
         float width  = wr * r_inv;
         float height = hr * r_inv;
@@ -532,179 +843,15 @@ struct screen_consumer
     }
 };
 
-struct host_strategy : public display_strategy
+void screen_consumer::set_visibility(bool visible)
 {
-    virtual ~host_strategy() {}
+    new_visibility_state_.store(visible);
+    visibility_change_requested_.store(true);
+}
 
-    virtual frame init_frame(const configuration& config, const core::video_format_desc& format_desc) override
-    {
-        screen::frame frame;
-        auto          flags = GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT | GL_MAP_WRITE_BIT;
-        GL(glCreateBuffers(1, &frame.pbo));
-        auto size_multiplier = config.high_bitdepth ? 2 : 1;
-        GL(glNamedBufferStorage(frame.pbo, format_desc.size * size_multiplier, nullptr, flags));
-        frame.ptr = reinterpret_cast<char*>(
-            GL2(glMapNamedBufferRange(frame.pbo, 0, format_desc.size * size_multiplier, flags)));
+bool screen_consumer::get_visibility() const { return window_visible_.load(); }
 
-        GL(glCreateTextures(GL_TEXTURE_2D, 1, &frame.tex));
-        GL(glTextureParameteri(frame.tex,
-                               GL_TEXTURE_MIN_FILTER,
-                               (config.colour_space == configuration::colour_spaces::datavideo_full ||
-                                config.colour_space == configuration::colour_spaces::datavideo_limited)
-                                   ? GL_NEAREST
-                                   : GL_LINEAR));
-        GL(glTextureParameteri(frame.tex,
-                               GL_TEXTURE_MAG_FILTER,
-                               (config.colour_space == configuration::colour_spaces::datavideo_full ||
-                                config.colour_space == configuration::colour_spaces::datavideo_limited)
-                                   ? GL_NEAREST
-                                   : GL_LINEAR));
-        GL(glTextureParameteri(frame.tex, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
-        GL(glTextureParameteri(frame.tex, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
-        GL(glTextureStorage2D(
-            frame.tex, 1, config.high_bitdepth ? GL_RGBA16 : GL_RGBA8, format_desc.width, format_desc.height));
-        GL(glClearTexImage(
-            frame.tex, 0, GL_BGRA, config.high_bitdepth ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE, nullptr));
-
-        return frame;
-    }
-
-    virtual void cleanup_frame(frame& frame) override
-    {
-        GL(glUnmapNamedBuffer(frame.pbo));
-        glDeleteBuffers(1, &frame.pbo);
-        glDeleteTextures(1, &frame.tex);
-    }
-
-    virtual void do_tick(screen_consumer* self) override
-    {
-        core::const_frame in_frame;
-
-        while (!self->frame_buffer_.try_pop(in_frame) && self->is_running_) {
-            // TODO (fix)
-            if (!self->poll()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            }
-        }
-
-        if (!in_frame) {
-            return;
-        }
-
-        // Upload
-        {
-            auto& frame = self->frames_.front();
-
-            while (frame.fence != nullptr) {
-                auto wait = glClientWaitSync(frame.fence, 0, 0);
-                if (wait == GL_ALREADY_SIGNALED || wait == GL_CONDITION_SATISFIED) {
-                    glDeleteSync(frame.fence);
-                    frame.fence = nullptr;
-                }
-                if (!self->poll()) {
-                    // TODO (fix)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                }
-            }
-
-            auto size_multiplier = self->config_.high_bitdepth ? 2 : 1;
-            std::memcpy(frame.ptr, in_frame.image_data(0).begin(), self->format_desc_.size * size_multiplier);
-
-            GL(glBindBuffer(GL_PIXEL_UNPACK_BUFFER, frame.pbo));
-            GL(glTextureSubImage2D(frame.tex,
-                                   0,
-                                   0,
-                                   0,
-                                   self->format_desc_.width,
-                                   self->format_desc_.height,
-                                   GL_BGRA,
-                                   self->config_.high_bitdepth ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE,
-                                   nullptr));
-            GL(glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0));
-
-            frame.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-        }
-
-        // Display
-        {
-            auto& frame = self->frames_.back();
-
-            GL(glClear(GL_COLOR_BUFFER_BIT));
-
-            GL(glActiveTexture(GL_TEXTURE0));
-            GL(glBindTexture(GL_TEXTURE_2D, frame.tex));
-
-            self->draw();
-        }
-    }
-};
-
-struct gpu_strategy : public display_strategy
-{
-    virtual ~gpu_strategy() {}
-    virtual frame init_frame(const configuration& config, const core::video_format_desc& format_desc) override
-    {
-        return frame();
-    }
-    virtual void cleanup_frame(frame& frame) override
-    {
-        if (frame.fence) {
-            glDeleteSync(frame.fence);
-            frame.fence = nullptr;
-        }
-        frame.texture.reset();
-    }
-
-    virtual void do_tick(screen_consumer* self) override
-    {
-        core::const_frame in_frame;
-
-        self->poll();
-
-        while (!self->frame_buffer_.try_pop(in_frame) && self->is_running_) {
-            // TODO (fix)
-            if (!self->poll()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            }
-        }
-
-        // Display
-        {
-            auto& frame = self->frames_.front();
-
-            while (frame.fence != nullptr && self->is_running_) {
-                auto wait = glClientWaitSync(frame.fence, 0, 0);
-                if (wait == GL_ALREADY_SIGNALED || wait == GL_CONDITION_SATISFIED) {
-                    glDeleteSync(frame.fence);
-                    frame.fence = nullptr;
-                    frame.texture.reset();
-                }
-
-                if (!self->poll()) {
-                    // TODO (fix)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                }
-            }
-
-            if (!in_frame || !self->is_running_) {
-                self->graph_->set_value("tick-time", self->tick_timer_.elapsed() * self->format_desc_.fps * 0.5);
-                self->tick_timer_.restart();
-                return;
-            }
-
-            GL(glClear(GL_COLOR_BUFFER_BIT));
-
-            if (in_frame.texture()) {
-                in_frame.texture()->bind(0);
-
-                self->draw();
-
-                frame.fence   = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-                frame.texture = in_frame.texture();
-            }
-        }
-    }
-};
+void screen_consumer::toggle_visibility() { set_visibility(!get_visibility()); }
 
 struct screen_consumer_proxy : public core::frame_consumer
 {
@@ -717,7 +864,7 @@ struct screen_consumer_proxy : public core::frame_consumer
     {
     }
 
-    // frame_consumer
+    // frame_consumer interface methods
 
     void initialize(const core::video_format_desc& format_desc,
                     const core::channel_info&      channel_info,
@@ -762,7 +909,8 @@ spl::shared_ptr<core::frame_consumer> create_consumer(const std::vector<std::wst
 
     configuration config;
 
-    config.high_bitdepth = (channel_info.depth != common::bit_depth::bit8);
+    if (channel_info.depth != common::bit_depth::bit8)
+        CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Screen consumer only supports 8-bit color depth."));
 
     if (params.size() > 1) {
         try {
@@ -772,7 +920,6 @@ spl::shared_ptr<core::frame_consumer> create_consumer(const std::vector<std::wst
     }
 
     config.windowed    = !contains_param(L"FULLSCREEN", params);
-    config.gpu_texture = contains_param(L"GPU", params);
     config.key_only    = contains_param(L"KEY_ONLY", params);
     config.sbs_key     = contains_param(L"SBS_KEY", params);
     config.interactive = !contains_param(L"NON_INTERACTIVE", params);
@@ -811,7 +958,8 @@ create_preconfigured_consumer(const boost::property_tree::wptree&               
 {
     configuration config;
 
-    config.high_bitdepth = (channel_info.depth != common::bit_depth::bit8);
+    if (channel_info.depth != common::bit_depth::bit8)
+        CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Screen consumer only supports 8-bit color depth."));
 
     config.name          = ptree.get(L"name", config.name);
     config.screen_index  = ptree.get(L"device", config.screen_index + 1) - 1;
@@ -826,7 +974,6 @@ create_preconfigured_consumer(const boost::property_tree::wptree&               
     config.interactive   = ptree.get(L"interactive", config.interactive);
     config.borderless    = ptree.get(L"borderless", config.borderless);
     config.always_on_top = ptree.get(L"always-on-top", config.always_on_top);
-    config.gpu_texture   = ptree.get(L"gpu-texture", config.gpu_texture);
 
     auto colour_space_value = ptree.get(L"colour-space", L"RGB");
     config.colour_space     = configuration::colour_spaces::RGB;
@@ -863,12 +1010,39 @@ create_preconfigured_consumer(const boost::property_tree::wptree&               
         config.stretch = screen::stretch::uniform_to_fill;
     }
 
-    auto aspect_str = ptree.get(L"aspect-ratio", L"default");
-    if (aspect_str == L"16:9") {
-        config.aspect = configuration::aspect_ratio::aspect_16_9;
-    } else if (aspect_str == L"4:3") {
-        config.aspect = configuration::aspect_ratio::aspect_4_3;
+    // Check if aspect-ratio is explicitly provided
+    auto aspect_str = ptree.get_optional<std::wstring>(L"aspect-ratio");
+    if (aspect_str) {
+        // Explicit aspect ratio provided
+        try {
+            config.aspect_ratio = parse_aspect_ratio(*aspect_str);
+        } catch (const std::exception& e) {
+            CASPAR_LOG(warning) << L"Failed to parse aspect-ratio '" << *aspect_str << L"', using default 16:9. Error: "
+                                << e.what();
+            config.aspect_ratio = 1.777;
+        }
+    } else if (config.screen_width > 0 && config.screen_height > 0) {
+        // No explicit aspect ratio, but width/height provided - calculate from dimensions
+        config.aspect_ratio = static_cast<double>(config.screen_width) / static_cast<double>(config.screen_height);
+        CASPAR_LOG(info) << L"Calculated aspect ratio " << std::fixed << std::setprecision(3) << config.aspect_ratio
+                         << L" from dimensions " << config.screen_width << L"x" << config.screen_height;
+    } else {
+        // No aspect ratio or dimensions provided, use default 16:9
+        config.aspect_ratio = 1.777;
     }
+
+    config.force_linear_filter = ptree.get(L"force-linear-filter", false);
+    config.enable_mipmaps      = ptree.get(L"enable-mipmaps", false);
+    config.brightness_boost    = ptree.get(L"brightness-boost", 1.0);
+    config.saturation_boost    = ptree.get(L"saturation-boost", 1.0);
+    config.high_quality_chroma = ptree.get(L"high-quality-chroma", false);
+
+    CASPAR_LOG(info) << L"Screen consumer configuration:";
+    CASPAR_LOG(info) << L"  aspect_ratio: " << config.aspect_ratio;
+    CASPAR_LOG(info) << L"  force_linear_filter: " << (config.force_linear_filter ? L"true" : L"false");
+    CASPAR_LOG(info) << L"  enable_mipmaps: " << (config.enable_mipmaps ? L"true" : L"false");
+    CASPAR_LOG(info) << L"  brightness_boost: " << config.brightness_boost;
+    CASPAR_LOG(info) << L"  saturation_boost: " << config.saturation_boost;
 
     return spl::make_shared<screen_consumer_proxy>(config);
 }

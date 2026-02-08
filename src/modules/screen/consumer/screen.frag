@@ -18,6 +18,10 @@ uniform bool key_only;
 uniform int colour_space;
 uniform int window_width;
 
+// Enhanced color controls
+uniform float brightness_boost;
+uniform float saturation_boost;
+
 // rgb=0~255, y=16~235, uv=16~240
 mat3 rgb2yuv_709 = mat3(0.183f, -0.101f, 0.439f,  0.614f, -0.338f, -0.399f, 0.062f, 0.439f,-0.040f);
 
@@ -51,5 +55,20 @@ void main()
         color.t = clamp(((isEvenPixel ? color.t + color2.t : color.p + color2.p) * 0.5f) + RANGE_HALF + 0.5f, 0.0f, 1.0f);
         color.p = clamp(color.w + RANGE_HALF, 0.0f, 1.0f);
     }
+    
+    // Apply color enhancements (after color space conversion)
+    // Only apply to RGB channels, not key-only mode
+    if (!key_only && colour_space == COLOUR_SPACE_RGB) {
+        // Brightness boost
+        color.rgb *= brightness_boost;
+        
+        // Saturation boost (preserves luminance)
+        float luma = dot(color.rgb, vec3(0.299f, 0.587f, 0.114f));
+        color.rgb = mix(vec3(luma), color.rgb, saturation_boost);
+        
+        // Clamp to valid range
+        color.rgb = clamp(color.rgb, 0.0f, 1.0f);
+    }
+    
     fragColor = color;
 }
