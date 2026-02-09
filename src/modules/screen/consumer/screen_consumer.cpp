@@ -958,9 +958,7 @@ create_preconfigured_consumer(const boost::property_tree::wptree&               
 {
     configuration config;
 
-    if (channel_info.depth != common::bit_depth::bit8)
-        CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Screen consumer only supports 8-bit color depth."));
-
+    config.high_bitdepth = (channel_info.depth != common::bit_depth::bit8);
     config.name          = ptree.get(L"name", config.name);
     config.screen_index  = ptree.get(L"device", config.screen_index + 1) - 1;
     config.screen_x      = ptree.get(L"x", config.screen_x);
