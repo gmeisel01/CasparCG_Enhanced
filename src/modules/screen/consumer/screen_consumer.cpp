@@ -95,6 +95,7 @@ struct configuration
     int             screen_height       = 0;
     screen::stretch stretch             = screen::stretch::fill;
     bool            windowed            = true;
+    bool            high_bitdepth       = false;
     bool            key_only            = false;
     bool            sbs_key             = false;
     double          aspect_ratio        = 1.777; // Default to 16:9, replaces enum
