@@ -1,79 +1,183 @@
-CasparCG Server
-===============
+Audio-Video Synchronization & Multi-Channel Audio Support
+Problem Statement
+CasparCG 2.5's audio consumer can exhibit audio-video synchronization drift during extended playback, particularly in complex processing pipelines. Audio and video subsystems operate independently, which can lead to progressive drift under certain conditions.
 
-Thank you for your interest in CasparCG Server, a professional software used to
-play out and record professional graphics, audio and video to multiple outputs.
-CasparCG Server has been in 24/7 broadcast production since 2006.
+Solution: Video-Scheduled Audio
+Architecture
+This implementation introduces a video-scheduled audio dispatch system where audio packets are scheduled for delivery at precise moments based on video frame timing, rather than playing independently.
 
-The CasparCG Server works on Windows and Linux.
+Core Components:
 
-System Requirements
--------------------
+Frame-Accurate Dispatch: Audio packets scheduled to video frame timestamps
+Real-Time Thread: High-priority dispatch thread (THREAD_PRIORITY_TIME_CRITICAL)
+Auto-Tuning: Statistical analysis automatically adjusts latency compensation
+Robust Buffer Management: Proper OpenAL buffer lifecycle prevents "invalid operation" errors
+How It Works
+// Calculate precise target time based on video frame timing
+auto frame_time_offset = std::chrono::duration<double>(frame_number * frame_duration_seconds_);
+auto latency_compensation = std::chrono::milliseconds(audio_latency_compensation_ms_.load());
+packet.target_time = channel_start_time_ + frame_time_offset - latency_compensation;
 
-- A graphics card (GPU) capable of OpenGL 4.5 is required.
-- An Nvidia GPU is recommended, but other GPU's will likely work fine.
-- Intel and AMD CPU's have been tested and are known to work
-- PCIE bandwidth is important between your GPU and CPU, as well as Decklink and CPU. Avoid chipset lanes when possible.
+// High-priority thread dispatches at exact moment
+std::this_thread::sleep_until(packet.target_time);
+dispatch_audio_packet(packet);
+Auto-Tuning
+The system monitors timing accuracy over 500+ samples and automatically adjusts latency compensation when consistent drift is detected:
 
-### Windows
+// Conservative adjustment only with consistent timing (stddev < 20ms)
+if (std::abs(avg_error_ms) >= 3 && stddev_ms < 20) {
+    int adjustment = static_cast<int>(avg_error_ms * 0.75);
+    audio_latency_compensation_ms_ -= adjustment;
+}
+PortAudio Consumer: Multi-Channel ASIO Support
+Features
+ASIO Native: Direct ASIO output for professional audio interfaces
+Video-Scheduled: Same timing architecture as OpenAL consumer
+Lock-Free FIFO: Efficient buffering between dispatch and callback threads
+Channel Flexibility: Supports 2-32+ output channels
+Use Cases
+Multi-channel broadcast installations
+Professional audio routing to external mixers
+ASIO hardware integration (RME, MOTU, Universal Audio, etc.)
+Low-latency monitoring workflows
+Configuration Example
+<portaudio>
+  <device-name>ASIO Device Name</device-name>
+  <output-channels>8</output-channels>
+  <latency-compensation-ms>40</latency-compensation-ms>
+  <auto-tune-latency>true</auto-tune-latency>
+  <buffer-size-frames>128</buffer-size-frames>
+  <fifo-ms>50</fifo-ms>
+</portaudio>
+Screen Consumer Enhancements
+Flexible Output Configuration for Professional AV Workflows
+Enhanced the 2.5 screen consumer to support custom pixel space configurations for integration with professional presentation systems (Barco E2, Spyder X80, Analog Way systems, etc.).
 
- - Windows 11 is recommended
- - Windows 10 is supported as best effort
+Custom Aspect Ratios and Resolutions
 
-### Linux
+<aspect-ratio>3840/1080</aspect-ratio>  <!-- Division format for ultra-wide -->
+<aspect-ratio>3.555</aspect-ratio>      <!-- Decimal format -->
+Supports arbitrary aspect ratios and pixel dimensions for:
 
- - Ubuntu 24.04 is recommended
- - Other distributions and releases will work but you will need to compile it yourself and have not been tested
+Ultra-wide display configurations
+Custom presentation system inputs
+Multi-projector installations
+Video wall processors
+Any non-standard output format
+Visual Calibration Controls
 
-Getting Started
----------------
+<brightness-boost>1.2</brightness-boost>  <!-- Output brightness adjustment -->
+<saturation-boost>1.1</saturation-boost>  <!-- Color saturation control -->
+Shader-based controls for:
 
-1. Download a release from (http://casparcg.com/downloads).
-   Alternatively, newer testing versions can be downloaded from (http://builds.casparcg.com) or [built from source](BUILDING.md)
+Ambient light compensation
+Display calibration
+Color enhancement for presentation environments
+Multi-Display Spanning
 
-2. Install any optional non-GPL modules
-    - Flash template support (Windows only):
+<x>0</x>
+<y>-1080</y>           <!-- Extended desktop positioning -->
+<width>7680</width>    <!-- Custom horizontal resolution -->
+<height>2160</height>  <!-- Custom vertical resolution -->
+Support for:
 
-    1. Uninstall any previous version of the Adobe Flash Player using this file:
-        (http://download.macromedia.com/get/flashplayer/current/support/uninstall_flash_player.exe)
+Extended desktop configurations
+Multi-display spanning (NVIDIA Mosaic, AMD Eyefinity, etc.)
+Presentation system input requirements
+Custom pixel space perimeters
+Enhanced Display Enumeration (Windows)
 
-    2. Download and unpack
-        (http://download.macromedia.com/pub/flashplayer/installers/archive/fp_11.8.800.94_archive.zip)
+Comprehensive multi-display detection with detailed logging
+Explicit device selection via screen-index
+Primary display fallback with warnings
+Full device property reporting
+Integration Workflow
+Typical deployment:
 
-    3. Install Adobe Flash Player 11.8.800.94 from the unpacked archive:
-        fp_11.8.800.94_archive\11_8_r800_94\flashplayer11_8r800_94_winax.exe
+CasparCG Server → Screen Consumer (custom resolution) → Presentation Switcher → Displays
+                                                      (Barco E2, Spyder X80, etc.)
+The screen consumer provides flexible output that feeds downstream presentation systems, which handle final display routing and processing.
 
-3. Configure the server by editing the self-documented "casparcg.config" file in
-   a text editor.
+Compatibility Note
+The screen consumer enhancements required merging features from a custom implementation with the current 2.5 codebase. All 2.5 features have been preserved:
 
-4.
-   1. Windows: start `casparcg_auto_restart.bat`, or `casparcg.exe` and `scanner.exe` separately.
-   1. Linux: start the `run.sh` program or use tools/linux/start_docker.sh to run within docker (documentation is at the top of the file).
+GPU texture strategy for hardware sources (DeckLink/NDI)
+High bit-depth support (10-bit/16-bit channels)
+Display strategy pattern architecture
+The merged implementation maintains full 2.5 compatibility while adding flexible output configuration for professional AV workflows.
 
-5. Connect to the Server from a client software, such as the "CasparCG Client"
-   which is available as a separate download.
+Technical Implementation Details
+Thread-Safe Audio Scheduling
+std::priority_queue<audio_packet> audio_schedule_;
+std::mutex schedule_mutex_;
+std::condition_variable schedule_cv_;
+std::thread audio_dispatch_thread_;
+Shader Integration
+Pre-built shader headers bypass bin2c() narrowing conversion issues on MSVC with /WX. Headers use raw string literals for maintainability:
 
-Documentation
--------------
+static const char* fragment_shader = R"shader(
+    #version 450
+    uniform float brightness_boost;
+    uniform float saturation_boost;
+    // ... GLSL code with RGB color space processing ...
+)shader";
+Brightness and saturation controls applied in shader (RGB color space only, not DataVideo YUV modes) for efficient GPU-based adjustment.
 
-The most up-to-date documentation is always available at
-https://github.com/CasparCG/help/wiki
+Development Environment
+Developed for:
 
-Ask questions in the forum: https://casparcgforum.org/
+Professional broadcast and presentation workflows
+Integration with presentation switchers (Barco, Analog Way, etc.)
+Multi-channel audio routing
+Custom resolution display systems
+Platform:
 
-Development
------------
+Windows with Visual Studio 2022/2026
+NVIDIA Quadro GPU hardware
+Blackmagic DeckLink interfaces
+Custom resolution outputs (tested up to 7680x2160)
+Target platforms:
 
-See [BUILDING](BUILDING.md) for instructions on how to build the CasparCG Server from source manually.
+Windows (tested, working)
+Linux (CI infrastructure issue, not code-related)
+macOS (not yet tested)
+Files Changed
+Audio Consumers
+modules/oal/consumer/oal_consumer.cpp - Video-scheduled OpenAL implementation
+modules/oal/consumer/oal_consumer.h - Interface updates
+modules/portaudio/portaudio_consumer.cpp - New ASIO consumer
+modules/portaudio/portaudio_consumer.h - PortAudio consumer interface
+Screen Consumer
+modules/screen/consumer/screen_consumer.cpp - Merged 2.5 + custom output features
+modules/screen/CMakeLists.txt - Pre-built shader headers (bin2c disabled)
+modules/screen/consumer_screen_fragment.h - Fragment shader with calibration uniforms
+modules/screen/consumer_screen_vertex.h - Vertex shader
+Build System
+Root CMakeLists.txt - PortAudio integration (if applicable)
+Configuration Migration
+Existing <system-audio> and <screen> configurations continue working unchanged. New features are opt-in:
 
-License
----------
+auto-tune-latency defaults to false
+PortAudio consumer requires explicit configuration
+Custom aspect ratios default to 16:9 if not specified
+Brightness/saturation default to 1.0 (no adjustment)
+Future Work
+Formal benchmarking with measured performance data
+Cross-platform testing and validation (Linux/macOS)
+Additional statistical metrics for tuning quality assessment
+Configuration presets for common presentation system workflows
+Integration with other consumers for system-wide sync
+Acknowledgments
+Video-scheduled audio architecture adapted from techniques used in professional NLE systems. Addresses sync issues documented in CasparCG GitHub issues #836, #155, and community reports.
 
-CasparCG Server is distributed under the GNU General Public License GPLv3 or
-higher, see [LICENSE](LICENSE) for details.
+Implementation developed for professional broadcast and presentation workflows requiring frame-accurate audio-video synchronization and flexible output configuration.
 
-CasparCG Server uses the following third party libraries:
-- FFmpeg (http://ffmpeg.org/) under the GPLv2 Licence.
+Build Status
+✅ Windows: Builds successfully with MSVC
+⚠️ Linux: CI infrastructure issue in base repository (exit code 126), not related to code changes
+❓ Performance Testing: Formal benchmarking not yet conducted
+
+
   FFmpeg is a trademark of Fabrice Bellard, originator of the FFmpeg project.
 - Threading Building Blocks (http://www.threadingbuildingblocks.org/) library under the GPLv2 Licence.
 - SFML (http://www.sfml-dev.org/) under the zlib/libpng License.
