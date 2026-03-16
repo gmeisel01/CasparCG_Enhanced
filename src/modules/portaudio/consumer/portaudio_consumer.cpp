@@ -282,6 +282,9 @@ int find_device_by_name(const std::wstring& device_name, int api_index)
         } else if (boost::iequals(search_name_no_spaces, dev_name_no_spaces)) {
             found_device = device_index;
             CASPAR_LOG(info) << L"  ** FUZZY MATCH **";
+        } else if (dev_name_no_spaces.find(search_name_no_spaces) != std::string::npos) {
+            found_device = device_index;
+            CASPAR_LOG(info) << L"  ** SUBSTRING MATCH **";
         }
     }
 
@@ -842,7 +845,7 @@ class portaudio_consumer : public core::frame_consumer
                 CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Audio device sample rate mismatch"));
             }
 
-            CASPAR_LOG(info) << L"??? ASIO format check passed: " << format_desc_.audio_sample_rate << L" Hz";
+            CASPAR_LOG(info) << L"Format check passed: " << format_desc_.audio_sample_rate << L" Hz";
 
             // Open stream
             PaError err = Pa_OpenStream(&stream_,
@@ -894,7 +897,7 @@ class portaudio_consumer : public core::frame_consumer
             size_t             prefilled = audio_fifo_.write(silence.data(), prefill_samples);
 
             CASPAR_LOG(info) << L"Pre-filled FIFO with " << prefilled << L" silent samples ("
-                             << (prefilled / output_channels_ / format_desc_.audio_sample_rate * 1000.0) << L" ms) = "
+                             << (static_cast<double>(prefilled) / static_cast<double>(output_channels_) / static_cast<double>(format_desc_.audio_sample_rate) * 1000.0) << L" ms) = "
                              << (prefilled * 100 / audio_fifo_.capacity()) << L"% full";
 
             // Start stream
